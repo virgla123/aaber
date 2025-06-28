@@ -4,8 +4,6 @@ import asyncio
 import aiohttp
 import logging
 from datetime import datetime
-import random
-import time
 
 # Configuration
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
@@ -155,116 +153,60 @@ STEAM_ACCOUNTS = [
 DATA_FILE = 'friend_data.json'
 INIT_FILE = '.initialized'
 
-# Optimized rate limiting configuration for speed
-MAX_CONCURRENT_REQUESTS = 50  # High concurrency
-REQUEST_DELAY = 0.1  # Very short delay between requests
-BURST_SIZE = 100  # Allow bursts of requests
-BURST_DELAY = 5  # Pause after each burst
-MAX_RETRIES = 2  # Limit retries to keep speed up
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SteamFriendIDMonitor")
-
-class FastRateLimiter:
-    def __init__(self, max_concurrent=50, burst_size=100, burst_delay=5):
-        self.semaphore = asyncio.Semaphore(max_concurrent)
-        self.burst_size = burst_size
-        self.burst_delay = burst_delay
-        self.request_count = 0
-        self.last_burst_reset = None
-        self.loop = None
-    
-    async def acquire(self):
-        if self.loop is None:
-            self.loop = asyncio.get_event_loop()
-            self.last_burst_reset = self.loop.time()
-        
-        await self.semaphore.acquire()
-        
-        # Check if we need to pause after a burst
-        self.request_count += 1
-        if self.request_count >= self.burst_size:
-            current_time = self.loop.time()
-            time_since_reset = current_time - self.last_burst_reset
-            
-            if time_since_reset < self.burst_delay:
-                sleep_time = self.burst_delay - time_since_reset
-                logger.debug(f"Burst limit reached, sleeping for {sleep_time:.2f}s")
-                await asyncio.sleep(sleep_time)
-            
-            self.request_count = 0
-            self.last_burst_reset = self.loop.time()
-        
-        # Small delay to prevent hammering
-        await asyncio.sleep(0.05 + random.uniform(0, 0.05))
-    
-    def release(self):
-        self.semaphore.release()
-
-# Rate limiter will be created inside the main function
 
 def get_profile_link(steam_id):
     """Generate Steam profile link from Steam ID"""
     return f"steamcommunity.com/profiles/{steam_id}"
 
-async def fetch_friend_list(session, steam_id, rate_limiter, retry_count=0):
-    """Fetch the complete friend list for a Steam account with optimized rate limiting"""
+async def fetch_friend_list(session, steam_id):
+    """Fetch the complete friend list for a Steam account"""
     url = f"http://api.steampowered.com/ISteamUser/GetFriendList/v0001/?key={STEAM_API_KEY}&steamid={steam_id}&relationship=friend"
     profile_link = get_profile_link(steam_id)
     
-    await rate_limiter.acquire()
     try:
         async with session.get(url, timeout=10) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 friends_data = data.get('friendslist', {}).get('friends', [])
+                # Extract just the Steam IDs of friends
                 friend_ids = [friend['steamid'] for friend in friends_data]
                 return steam_id, profile_link, friend_ids
             elif resp.status == 403:
-                logger.debug(f"{profile_link} is private")
+                logger.warning(f"{profile_link} is private")
                 return steam_id, profile_link, None
-            elif resp.status in [429, 420]:
-                if retry_count < MAX_RETRIES:
-                    # Exponential backoff for rate limits
-                    delay = (2 ** retry_count) + random.uniform(0, 1)
-                    logger.warning(f"{profile_link}: Rate limited, retrying in {delay:.2f}s")
-                    await asyncio.sleep(delay)
-                    return await fetch_friend_list(session, steam_id, rate_limiter, retry_count + 1)
-                else:
-                    logger.error(f"{profile_link}: Max retries exceeded for rate limit")
-                    return steam_id, profile_link, None
             else:
-                logger.warning(f"{profile_link}: API error {resp.status}")
+                logger.error(f"{profile_link}: API error {resp.status}")
                 return steam_id, profile_link, None
-    except asyncio.TimeoutError:
-        logger.warning(f"Timeout fetching {profile_link}")
-        return steam_id, profile_link, None
     except Exception as e:
-        logger.warning(f"Error fetching {profile_link}: {e}")
+        logger.error(f"Error fetching {profile_link}: {e}")
         return steam_id, profile_link, None
-    finally:
-        rate_limiter.release()
 
 async def send_telegram_message(message):
     """Send message to Telegram, splitting if too long"""
-    MAX_MESSAGE_LENGTH = 4000
+    MAX_MESSAGE_LENGTH = 4000  # Leave some buffer under 4096 limit
     
     if len(message) <= MAX_MESSAGE_LENGTH:
         await _send_single_message(message)
     else:
+        # Split message into chunks
         lines = message.split('\n')
         current_chunk = ""
         
         for line in lines:
+            # If adding this line would exceed limit, send current chunk
             if len(current_chunk + line + '\n') > MAX_MESSAGE_LENGTH:
                 if current_chunk:
                     await _send_single_message(current_chunk.strip())
                     current_chunk = line + '\n'
                 else:
+                    # Single line is too long, truncate it
                     await _send_single_message(line[:MAX_MESSAGE_LENGTH])
             else:
                 current_chunk += line + '\n'
         
+        # Send remaining chunk
         if current_chunk:
             await _send_single_message(current_chunk.strip())
 
@@ -308,98 +250,50 @@ def is_first_run():
     return True
 
 async def check_accounts():
-    """Main function to check all accounts for friend changes - optimized for speed"""
-    start_time = time.time()
+    """Main function to check all accounts for friend changes"""
     first_run = is_first_run()
     previous_data = load_previous_data()
     current_data = {}
-    all_new_friends = []
+    all_new_friends = []  # Collect all new friends for batched notification
     
-    # Create rate limiter inside the async function
-    rate_limiter = FastRateLimiter(MAX_CONCURRENT_REQUESTS, BURST_SIZE, BURST_DELAY)
-    
-    logger.info(f"Starting fast check for {len(STEAM_ACCOUNTS)} accounts...")
-    
-    # Optimized session configuration for high throughput
-    connector = aiohttp.TCPConnector(
-        limit=200,  # High connection pool
-        limit_per_host=100,  # High per-host limit
-        ttl_dns_cache=300,  # DNS cache
-        use_dns_cache=True,
-        keepalive_timeout=30,
-        enable_cleanup_closed=True
-    )
-    
-    timeout = aiohttp.ClientTimeout(total=15, connect=5)
-    
-    async with aiohttp.ClientSession(
-        connector=connector, 
-        timeout=timeout,
-        headers={'User-Agent': 'SteamFriendMonitor/1.0'}
-    ) as session:
-        
-        # Create all tasks at once for maximum concurrency
-        tasks = [fetch_friend_list(session, steam_id, rate_limiter) for steam_id in STEAM_ACCOUNTS]
-        
-        # Progress tracking
-        completed = 0
-        total = len(tasks)
-        
-        # Process all requests concurrently with progress updates
-        for coro in asyncio.as_completed(tasks):
-            try:
-                steam_id, profile_link, friend_ids = await coro
-                completed += 1
-                
-                # Progress update every 500 accounts
-                if completed % 500 == 0 or completed == total:
-                    elapsed = time.time() - start_time
-                    rate = completed / elapsed
-                    eta = (total - completed) / rate if rate > 0 else 0
-                    logger.info(f"Progress: {completed}/{total} ({completed/total*100:.1f}%) - {rate:.1f} req/s - ETA: {eta:.1f}s")
-                
-                if friend_ids is None:
-                    continue
-                    
-                current_data[steam_id] = {
-                    'profile_link': profile_link,
-                    'friends': friend_ids,
-                    'count': len(friend_ids)
-                }
-                
-                # Skip change detection on first run
-                if first_run or steam_id not in previous_data:
-                    continue
-                    
-                previous_friends = set(previous_data[steam_id].get('friends', []))
-                current_friends = set(friend_ids)
-                
-                # Check for new friends only
-                new_friends = current_friends - previous_friends
-                if new_friends:
-                    for friend_id in new_friends:
-                        friend_profile_link = get_profile_link(friend_id)
-                        all_new_friends.append(friend_profile_link)
-                        logger.info(f"New friend detected: {friend_id} added to {steam_id}")
-                
-                # Log removed friends (no telegram notification)
-                removed_friends = previous_friends - current_friends
-                if removed_friends:
-                    for friend_id in removed_friends:
-                        logger.debug(f"Friend removed: {friend_id} removed from {steam_id}")
-                        
-            except Exception as e:
-                logger.error(f"Error processing task: {e}")
-                completed += 1
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_friend_list(session, steam_id) for steam_id in STEAM_ACCOUNTS]
+        results = await asyncio.gather(*tasks)
 
-    total_time = time.time() - start_time
-    successful_accounts = len(current_data)
-    avg_rate = successful_accounts / total_time if total_time > 0 else 0
-    
-    logger.info(f"Completed in {total_time:.2f}s - {avg_rate:.1f} accounts/sec - {successful_accounts}/{len(STEAM_ACCOUNTS)} successful")
+    for steam_id, profile_link, friend_ids in results:
+        if friend_ids is None:
+            continue
+            
+        current_data[steam_id] = {
+            'profile_link': profile_link,
+            'friends': friend_ids,
+            'count': len(friend_ids)
+        }
+        
+        # Skip change detection on first run
+        if first_run or steam_id not in previous_data:
+            continue
+            
+        previous_friends = set(previous_data[steam_id].get('friends', []))
+        current_friends = set(friend_ids)
+        
+        # Check for new friends only
+        new_friends = current_friends - previous_friends
+        if new_friends:
+            for friend_id in new_friends:
+                friend_profile_link = get_profile_link(friend_id)
+                all_new_friends.append(friend_profile_link)
+                logger.info(f"New friend detected: {friend_id} added to {steam_id}")
+        
+        # Log removed friends (no telegram notification)
+        removed_friends = previous_friends - current_friends
+        if removed_friends:
+            for friend_id in removed_friends:
+                logger.info(f"Friend removed: {friend_id} removed from {steam_id}")
 
     # Send batched notification for all new friends
     logger.info(f"Total new friends collected: {len(all_new_friends)}")
+    logger.info(f"First run status: {first_run}")
     
     if all_new_friends and not first_run:
         if len(all_new_friends) == 1:
@@ -408,8 +302,9 @@ async def check_accounts():
             msg = f"New friends detected ({len(all_new_friends)}):\n\n"
             msg += "\n".join([f"• {friend_link}" for friend_link in all_new_friends])
         
-        logger.info(f"Sending Telegram notification for {len(all_new_friends)} new friends")
+        logger.info(f"Attempting to send Telegram message: {msg[:100]}...")
         await send_telegram_message(msg)
+        logger.info(f"Sent batched notification for {len(all_new_friends)} new friends")
     elif all_new_friends and first_run:
         logger.info(f"New friends detected on first run (not sending notification): {len(all_new_friends)}")
     else:
@@ -419,6 +314,7 @@ async def check_accounts():
     save_data(current_data)
 
     if first_run:
+        # Log initial setup (no telegram messages)
         total_accounts = len(current_data)
         private_accounts = len(STEAM_ACCOUNTS) - total_accounts
         total_friends = sum(data['count'] for data in current_data.values())
@@ -430,7 +326,7 @@ async def check_accounts():
             logger.info(f"{private_accounts} accounts are private")
         logger.info("Bot will now notify when specific friends are added with their Steam IDs")
     else:
-        logger.info(f"Friend check completed. Successfully processed {successful_accounts} accounts in {total_time:.2f}s")
+        logger.info("Friend check completed")
 
 if __name__ == '__main__':
     asyncio.run(check_accounts())
