@@ -648,15 +648,20 @@ class FastRateLimiter:
         self.burst_size = burst_size
         self.burst_delay = burst_delay
         self.request_count = 0
-        self.last_burst_reset = time.time()
+        self.last_burst_reset = None
+        self.loop = None
     
     async def acquire(self):
+        if self.loop is None:
+            self.loop = asyncio.get_event_loop()
+            self.last_burst_reset = self.loop.time()
+        
         await self.semaphore.acquire()
         
         # Check if we need to pause after a burst
         self.request_count += 1
         if self.request_count >= self.burst_size:
-            current_time = time.time()
+            current_time = self.loop.time()
             time_since_reset = current_time - self.last_burst_reset
             
             if time_since_reset < self.burst_delay:
@@ -665,7 +670,7 @@ class FastRateLimiter:
                 await asyncio.sleep(sleep_time)
             
             self.request_count = 0
-            self.last_burst_reset = time.time()
+            self.last_burst_reset = self.loop.time()
         
         # Small delay to prevent hammering
         await asyncio.sleep(0.05 + random.uniform(0, 0.05))
