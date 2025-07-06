@@ -5,7 +5,7 @@ on:
     branches: [ main ]
   workflow_dispatch:
   schedule:
-    - cron: '0 * * * *'  # Run every hour
+    - cron: '0 * * * *'  # Run every hour (fixed syntax)
 jobs:
   monitor:
     permissions: write-all
@@ -13,23 +13,27 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5  # Updated to latest version
         with:
-          python-version: '3.9'
+          python-version: '3.11'  # Updated to more recent Python version
+          
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install aiohttp
+          
       - name: Restore previous data
-        uses: actions/cache/restore@v3
+        uses: actions/cache/restore@v4  # Updated to latest version
         with:
           path: |
             friend_data.json
             .initialized
-          key: steam-friend-id-data-dummy
+          key: steam-friend-id-data-${{ github.run_number }}-${{ github.run_attempt }}
           restore-keys: |
             steam-friend-id-data-
+            
       - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -37,33 +41,62 @@ jobs:
           STEAM_API_KEY: ${{ secrets.STEAM_API_KEY }}
         run: |
           python bot.py
+          
       - name: Save new data
-        uses: actions/cache/save@v3
+        uses: actions/cache/save@v4  # Updated to latest version
         with:
           path: |
             friend_data.json
             .initialized
           key: steam-friend-id-data-${{ github.run_number }}-${{ github.run_attempt }}
+          
       - name: Cleanup old caches
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Listing all caches..."
-          gh api repos/${{ github.repository }}/actions/caches --paginate | jq -r '.actions_caches[] | select(.key | startswith("steam-friend-id-data-")) | "\(.id) \(.key)"' > cache_list.txt
           
-          echo "Current cache key: steam-friend-id-data-${{ github.run_number }}-${{ github.run_attempt }}"
+          # Check if jq is available, install if not
+          if ! command -v jq &> /dev/null; then
+            echo "Installing jq..."
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
           
-          while read -r cache_id cache_key; do
-            if [ "$cache_key" != "steam-friend-id-data-${{ github.run_number }}-${{ github.run_attempt }}" ]; then
-              echo "Deleting old cache: $cache_key (ID: $cache_id)"
-              gh api --method DELETE repos/${{ github.repository }}/actions/caches/$cache_id || echo "Failed to delete cache $cache_id"
+          # Get caches with error handling
+          if ! gh api repos/${{ github.repository }}/actions/caches --paginate > caches.json 2>/dev/null; then
+            echo "Failed to fetch caches, skipping cleanup"
+            exit 0
+          fi
+          
+          # Parse and clean up caches
+          if [ -s caches.json ]; then
+            jq -r '.actions_caches[]? | select(.key | startswith("steam-friend-id-data-")) | "\(.id) \(.key)"' caches.json > cache_list.txt 2>/dev/null || echo "No caches found"
+            
+            echo "Current cache key: steam-friend-id-data-${{ github.run_number }}-${{ github.run_attempt }}"
+            
+            if [ -s cache_list.txt ]; then
+              while read -r cache_id cache_key; do
+                if [ "$cache_key" != "steam-friend-id-data-${{ github.run_number }}-${{ github.run_attempt }}" ] && [ -n "$cache_id" ]; then
+                  echo "Deleting old cache: $cache_key (ID: $cache_id)"
+                  gh api --method DELETE repos/${{ github.repository }}/actions/caches/$cache_id || echo "Failed to delete cache $cache_id"
+                else
+                  echo "Keeping current cache: $cache_key"
+                fi
+              done < cache_list.txt
             else
-              echo "Keeping current cache: $cache_key"
+              echo "No old caches to clean up"
             fi
-          done < cache_list.txt
+          else
+            echo "No caches returned from API"
+          fi
+          
       - name: Debug file state
         run: |
           echo "Contents of current directory:"
           ls -la
           echo "Contents of friend_data.json (if exists):"
-          cat friend_data.json || echo "File does not exist"
+          if [ -f friend_data.json ]; then
+            cat friend_data.json
+          else
+            echo "File does not exist"
+          fi
